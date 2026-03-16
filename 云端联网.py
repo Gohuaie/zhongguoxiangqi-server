@@ -1,64 +1,65 @@
-import websockets
 import os
 import asyncio
 import websockets
 import json
 
-waiting_player = None
+# 存放当前房间内的玩家连接
+players = {'r': None, 'b': None}
 
 async def handler(websocket):
-    global waiting_player
-    print("有一个新连接...")
+    global players
+    print("新连接建立...")
+    my_side = None
 
     try:
-        if waiting_player is None:
-            # 第一个人进来，让他执红方并等待
-            waiting_player = websocket
-            await websocket.send(json.dumps({"type": "init", "side": "r", "message": "你是红方，等待对手加入..."}))
-            print("玩家1(红)已加入，等待玩家2...")
-            await websocket.wait_closed()
-        else:
-            # 第二个人进来，配对成功，他执黑方
-            player1 = waiting_player
-            player2 = websocket
-            waiting_player = None # 清空排队，让后面的人可以继续配对
-            
-            print("玩家2(黑)加入，游戏开始！")
+        async for message in websocket:
+            data = json.loads(message)
+            msg_type = data.get("type")
 
-            await player1.send(json.dumps({"type": "start", "opponent": "已连接"}))
-            await player2.send(json.dumps({"type": "init", "side": "b", "message": "你是黑方，游戏开始！"}))
+            # 1. 处理玩家加入并选择阵营
+            if msg_type == "join":
+                side = data.get("side") # 'r' 或 'b'
+                if players.get(side) is None:
+                    players[side] = websocket
+                    my_side = side
+                    await websocket.send(json.dumps({"type": "join_success", "side": side}))
+                    print(f"玩家加入了 {side} 方")
+                    
+                    # 如果双方都到齐了，通知游戏开始
+                    if players['r'] and players['b']:
+                        await players['r'].send(json.dumps({"type": "start"}))
+                        await players['b'].send(json.dumps({"type": "start"}))
+                else:
+                    # 如果该阵营已经有人了，拒绝加入
+                    await websocket.send(json.dumps({"type": "error", "message": "该阵营已被占用，请选择另一方！"}))
 
-            # 互相转发消息
-            await asyncio.gather(
-                forward_messages(player1, player2),
-                forward_messages(player2, player1)
-            )
+            # 2. 转发游戏内的交互指令（走棋、聊天、悔棋、认输等）
+            else:
+                if my_side:
+                    opponent_side = 'b' if my_side == 'r' else 'r'
+                    # 如果对手在线，直接把原消息原样转发给对手
+                    if players.get(opponent_side):
+                        await players[opponent_side].send(message)
 
     except websockets.exceptions.ConnectionClosed:
-        print("有人断开了连接")
-        if waiting_player == websocket:
-            waiting_player = None
-
-async def forward_messages(sender, receiver):
-    try:
-        async for message in sender:
-            await receiver.send(message)
-    except:
-        try:
-            await sender.send(json.dumps({"type": "error", "message": "对手已断线"}))
-        except:
-            pass
+        pass
+    finally:
+        # 玩家断开连接时的清理工作
+        if my_side and players.get(my_side) == websocket:
+            players[my_side] = None
+            print(f"{my_side} 方断开了连接")
+            opponent_side = 'b' if my_side == 'r' else 'r'
+            if players.get(opponent_side):
+                try:
+                    await players[opponent_side].send(json.dumps({"type": "opponent_left", "message": "对手已断开连接"}))
+                except:
+                    pass
 
 async def main():
-    # 云端平台会自动分配一个 PORT 环境变量，如果没有就默认用 8765
     port = int(os.environ.get("PORT", 8765))
     print(f"服务器运行在 0.0.0.0:{port}")
-    
-    # 注意：这里必须改成 "0.0.0.0"，允许所有外部网络访问
     async with websockets.serve(handler, "0.0.0.0", port):
         await asyncio.get_running_loop().create_future()
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-

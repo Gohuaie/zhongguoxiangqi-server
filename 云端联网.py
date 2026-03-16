@@ -3,57 +3,84 @@ import asyncio
 import websockets
 import json
 
-# 存放当前房间内的玩家连接
-players = {'r': None, 'b': None}
+# 记录所有连接到该网页的玩家
+connected_clients = set()
+# 记录已选定的阵营
+roles = {'r': None, 'b': None}
+
+async def broadcast_room_info():
+    """向大厅里所有人广播当前房间人数和阵营选择情况"""
+    info = {
+        "type": "room_info",
+        "count": len(connected_clients),
+        "roles": {
+            "r": roles['r'] is not None,
+            "b": roles['b'] is not None
+        }
+    }
+    msg = json.dumps(info)
+    for client in connected_clients:
+        try:
+            await client.send(msg)
+        except:
+            pass
 
 async def handler(websocket):
-    global players
+    global roles, connected_clients
     print("新连接建立...")
+    connected_clients.add(websocket)
     my_side = None
+
+    # 有人进来，广播刷新房间人数
+    await broadcast_room_info()
 
     try:
         async for message in websocket:
             data = json.loads(message)
             msg_type = data.get("type")
 
-            # 1. 处理玩家加入并选择阵营
+            # 1. 处理玩家点击"确定"加入阵营
             if msg_type == "join":
-                side = data.get("side") # 'r' 或 'b'
-                if players.get(side) is None:
-                    players[side] = websocket
+                side = data.get("side")
+                if roles.get(side) is None:
+                    roles[side] = websocket
                     my_side = side
                     await websocket.send(json.dumps({"type": "join_success", "side": side}))
-                    print(f"玩家加入了 {side} 方")
+                    print(f"玩家确认加入了 {side} 方")
                     
-                    # 如果双方都到齐了，通知游戏开始
-                    if players['r'] and players['b']:
-                        await players['r'].send(json.dumps({"type": "start"}))
-                        await players['b'].send(json.dumps({"type": "start"}))
+                    # 广播更新，让别人看到这个阵营被选了
+                    await broadcast_room_info()
+                    
+                    # 双方都选好，通知开战
+                    if roles['r'] and roles['b']:
+                        await roles['r'].send(json.dumps({"type": "start"}))
+                        await roles['b'].send(json.dumps({"type": "start"}))
                 else:
-                    # 如果该阵营已经有人了，拒绝加入
-                    await websocket.send(json.dumps({"type": "error", "message": "该阵营已被占用，请选择另一方！"}))
+                    await websocket.send(json.dumps({"type": "error", "message": "手慢了，该阵营刚被对方抢走啦！"}))
 
-            # 2. 转发游戏内的交互指令（走棋、聊天、悔棋、认输等）
+            # 2. 转发游戏内的指令
             else:
                 if my_side:
                     opponent_side = 'b' if my_side == 'r' else 'r'
-                    # 如果对手在线，直接把原消息原样转发给对手
-                    if players.get(opponent_side):
-                        await players[opponent_side].send(message)
+                    if roles.get(opponent_side):
+                        await roles[opponent_side].send(message)
 
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        # 玩家断开连接时的清理工作
-        if my_side and players.get(my_side) == websocket:
-            players[my_side] = None
+        # 玩家断线清理
+        connected_clients.remove(websocket)
+        if my_side and roles.get(my_side) == websocket:
+            roles[my_side] = None
             print(f"{my_side} 方断开了连接")
             opponent_side = 'b' if my_side == 'r' else 'r'
-            if players.get(opponent_side):
+            if roles.get(opponent_side):
                 try:
-                    await players[opponent_side].send(json.dumps({"type": "opponent_left", "message": "对手已断开连接"}))
+                    await roles[opponent_side].send(json.dumps({"type": "opponent_left", "message": "对手已断开连接"}))
                 except:
                     pass
+        # 广播有人离开
+        await broadcast_room_info()
 
 async def main():
     port = int(os.environ.get("PORT", 8765))

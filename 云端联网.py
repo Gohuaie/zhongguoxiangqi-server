@@ -6,9 +6,7 @@ import string
 import os
 
 # 全局状态管理
-# ROOMS 结构: { "room_id": {"pwd": "xxx", "players": set(), "roles": {"r": websocket, "b": websocket}} }
 ROOMS = {}
-# CLIENTS 结构: websocket -> {"room_id": "123", "side": "r"}
 CLIENTS = {}
 
 async def broadcast_room_info(room_id):
@@ -33,7 +31,6 @@ async def broadcast_room_info(room_id):
 
 async def send_room_list(websocket):
     """向请求大厅的玩家发送当前可用房间列表"""
-    # 只返回未满员的房间
     room_list = [
         {
             "id": rid, 
@@ -52,19 +49,15 @@ async def handle_disconnect(websocket):
         
         if room_id and room_id in ROOMS:
             room = ROOMS[room_id]
-            # 从房间中移除玩家
             if websocket in room["players"]:
                 room["players"].remove(websocket)
             
-            # 释放座位
             if side and room["roles"][side] == websocket:
                 room["roles"][side] = None
                 
-            # 如果房间空了，直接销毁房间
             if len(room["players"]) == 0:
                 del ROOMS[room_id]
             else:
-                # 如果还有人，通知对方“对手已离开”
                 for p in room["players"]:
                     try:
                         await p.send(json.dumps({"type": "opponent_left"}))
@@ -72,19 +65,24 @@ async def handle_disconnect(websocket):
                         pass
                 await broadcast_room_info(room_id)
         
-        # 清理该连接的全局记录
         CLIENTS[websocket] = {"room_id": None, "side": None}
 
 async def handler(websocket, path):
     CLIENTS[websocket] = {"room_id": None, "side": None}
     try:
         async for message in websocket:
-            try:
-                data = json.loads(message)
-                msg_data = json.loads(data.get("data", "{}")) # 微信小程序发送格式解析
-            except:
-                msg_data = json.loads(message) # 兼容原生测试格式
-
+            # ==========================================
+            # 【核心修复】：化繁为简，精准解析，彻底消灭空指令BUG
+            # ==========================================
+            msg_data = json.loads(message)
+            
+            # 兼容极少数被 "data" 包裹的情况，解开它
+            if "data" in msg_data and isinstance(msg_data["data"], str):
+                try:
+                    msg_data = json.loads(msg_data["data"])
+                except:
+                    pass
+            
             msg_type = msg_data.get("type")
 
             # 1. 获取房间列表
@@ -93,7 +91,6 @@ async def handler(websocket, path):
 
             # 2. 创建房间
             elif msg_type == "create_room":
-                # 生成4位随机房间号
                 room_id = ''.join(random.choices(string.digits, k=4))
                 while room_id in ROOMS:
                     room_id = ''.join(random.choices(string.digits, k=4))
@@ -131,7 +128,6 @@ async def handler(websocket, path):
                     await websocket.send(json.dumps({"type": "error", "msg": "房间密码错误"}))
                     continue
                 
-                # 验证通过，加入房间
                 room["players"].add(websocket)
                 CLIENTS[websocket]["room_id"] = room_id
                 
@@ -144,7 +140,7 @@ async def handler(websocket, path):
                 }))
                 await broadcast_room_info(room_id)
 
-            # 4. 离开房间 (退回大厅)
+            # 4. 离开房间
             elif msg_type == "leave_room":
                 await handle_disconnect(websocket)
                 await websocket.send(json.dumps({"type": "left_room"}))
@@ -158,21 +154,17 @@ async def handler(websocket, path):
                 side = msg_data.get("side")
                 room = ROOMS[room_id]
                 
-                # 如果这个座位没人占
                 if room["roles"][side] is None:
-                    # 先清空自己可能占用的旧座位
                     old_side = CLIENTS[websocket]["side"]
                     if old_side:
                         room["roles"][old_side] = None
                         
-                    # 坐上新座位
                     room["roles"][side] = websocket
                     CLIENTS[websocket]["side"] = side
                     
                     await websocket.send(json.dumps({"type": "join_success", "side": side}))
                     await broadcast_room_info(room_id)
                     
-                    # 检查是否双发都准备完毕，开始游戏
                     if room["roles"]["r"] is not None and room["roles"]["b"] is not None:
                         for p in room["players"]:
                             await p.send(json.dumps({"type": "start"}))
@@ -187,12 +179,12 @@ async def handler(websocket, path):
                     await websocket.send(json.dumps({"type": "cancel_success"}))
                     await broadcast_room_info(room_id)
 
-            # 7. 游戏对战指令中转 (move, action, chat)
+            # 7. 游戏对战指令中转
             elif msg_type in ["move", "action", "chat"]:
                 room_id = CLIENTS[websocket]["room_id"]
                 if room_id in ROOMS:
                     for p in ROOMS[room_id]["players"]:
-                        if p != websocket: # 只发给房间里的另一个人
+                        if p != websocket:
                             await p.send(json.dumps(msg_data))
 
     except websockets.exceptions.ConnectionClosed:
@@ -201,12 +193,10 @@ async def handler(websocket, path):
         await handle_disconnect(websocket)
 
 async def main():
-    # Render 云端环境通常会动态分配端口，通过环境变量 PORT 获取
     port = int(os.environ.get("PORT", 10000))
-    # 绑定到 0.0.0.0 以允许外部访问
     async with websockets.serve(handler, "0.0.0.0", port):
         print(f"服务器已启动，正在监听端口 {port}...")
-        await asyncio.Future()  # 永久运行
+        await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())

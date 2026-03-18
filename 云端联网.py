@@ -12,8 +12,7 @@ async def broadcast_room_info(room_id):
     if room_id not in ROOMS: return
     room = ROOMS[room_id]
     info = {
-        "type": "room_info",
-        "count": len(room["players"]),
+        "type": "room_info", "count": len(room["players"]),
         "roles": { "r": room["roles"]["r"] is not None, "b": room["roles"]["b"] is not None }
     }
     for player in list(room["players"]):
@@ -21,16 +20,7 @@ async def broadcast_room_info(room_id):
         except: pass
 
 async def send_room_list(websocket):
-    # 【修复 1 & 2】：不再隐藏满员房间，精确传递对局状态
-    room_list = [
-        {
-            "id": rid,
-            "count": len(r["players"]),
-            "hasPwd": bool(r["pwd"]),
-            "isPlaying": (r["roles"]["r"] is not None and r["roles"]["b"] is not None)
-        }
-        for rid, r in ROOMS.items()
-    ]
+    room_list = [{"id": rid, "count": len(r["players"]), "hasPwd": bool(r["pwd"]), "isPlaying": (r["roles"]["r"] is not None and r["roles"]["b"] is not None)} for rid, r in ROOMS.items()]
     try: await websocket.send(json.dumps({"type": "room_list", "rooms": room_list}))
     except: pass
 
@@ -41,10 +31,8 @@ async def handle_disconnect(websocket):
         
         if room_id and room_id in ROOMS:
             room = ROOMS[room_id]
-            if websocket in room["players"]:
-                room["players"].remove(websocket)
+            if websocket in room["players"]: room["players"].remove(websocket)
             
-            # 【修复 3】：精准判定，只有执棋者离开才触发炸房警报
             has_role = False
             if side and room["roles"][side] == websocket:
                 room["roles"][side] = None
@@ -57,7 +45,6 @@ async def handle_disconnect(websocket):
                     for p in list(room["players"]):
                         try: await p.send(json.dumps({"type": "opponent_left"}))
                         except: pass
-                # 无角色者离开，只需静默广播人数更新
                 await broadcast_room_info(room_id)
         
         CLIENTS[websocket] = {"room_id": None, "side": None}
@@ -92,14 +79,20 @@ async def handler(websocket, path):
                     if room["pwd"] and room["pwd"] != msg_data.get("pwd", "").strip():
                         await websocket.send(json.dumps({"type": "error", "msg": "房间密码错误"})); continue
                     
+                    # 【核心修复】：第3人及以上判定为纯观战者，屏蔽选角权限
+                    is_spectator = len(room["players"]) >= 2
                     room["players"].add(websocket)
                     CLIENTS[websocket]["room_id"] = room_id
                     roles_status = {"r": room["roles"]["r"] is not None, "b": room["roles"]["b"] is not None}
-                    await websocket.send(json.dumps({"type": "room_joined", "room_id": room_id, "count": len(room["players"]), "roles": roles_status}))
+                    
+                    if is_spectator:
+                        await websocket.send(json.dumps({"type": "spectator_joined", "room_id": room_id, "count": len(room["players"]), "roles": roles_status}))
+                    else:
+                        await websocket.send(json.dumps({"type": "room_joined", "room_id": room_id, "count": len(room["players"]), "roles": roles_status}))
+                    
                     await broadcast_room_info(room_id)
 
-                    # 【新增观战逻辑】：如果中途加入对局，通知此人直接进入游戏，并要求红方同步棋盘
-                    if roles_status["r"] and roles_status["b"]:
+                    if is_spectator and roles_status["r"] and roles_status["b"]:
                         await websocket.send(json.dumps({"type": "start"}))
                         red_player = room["roles"]["r"]
                         if red_player:
@@ -158,7 +151,6 @@ async def handler(websocket, path):
                         await websocket.send(json.dumps({"type": "cancel_success"}))
                         await broadcast_room_info(room_id)
 
-                # 【包含同步快照的转发通道】
                 elif msg_type in ["move", "action", "chat", "sync_board"]:
                     room_id = CLIENTS[websocket]["room_id"]
                     if room_id in ROOMS:
@@ -168,10 +160,8 @@ async def handler(websocket, path):
                                 except: pass
             except Exception as e:
                 print(f"解析出错: {e}")
-    except websockets.exceptions.ConnectionClosed:
-        pass
-    finally:
-        await handle_disconnect(websocket)
+    except websockets.exceptions.ConnectionClosed: pass
+    finally: await handle_disconnect(websocket)
 
 async def main():
     port = int(os.environ.get("PORT", 10000))

@@ -5,12 +5,10 @@ import random
 import string
 import os
 
-# 全局状态管理
 ROOMS = {}
 CLIENTS = {}
 
 async def broadcast_room_info(room_id):
-    """向房间内的所有玩家广播当前房间的人数和选角状态"""
     if room_id not in ROOMS:
         return
     room = ROOMS[room_id]
@@ -23,8 +21,6 @@ async def broadcast_room_info(room_id):
         }
     }
     message = json.dumps(info)
-    
-    # 【核心修复】：加上 list() 强制拷贝快照，防止掉线时集合大小改变导致崩溃
     for player in list(room["players"]):
         try:
             await player.send(message)
@@ -32,7 +28,6 @@ async def broadcast_room_info(room_id):
             pass
 
 async def send_room_list(websocket):
-    """向请求大厅的玩家发送当前可用房间列表"""
     room_list = [
         {
             "id": rid, 
@@ -47,7 +42,6 @@ async def send_room_list(websocket):
         pass
 
 async def handle_disconnect(websocket):
-    """处理玩家掉线或离开房间"""
     if websocket in CLIENTS:
         room_id = CLIENTS[websocket]["room_id"]
         side = CLIENTS[websocket]["side"]
@@ -63,7 +57,6 @@ async def handle_disconnect(websocket):
             if len(room["players"]) == 0:
                 del ROOMS[room_id]
             else:
-                # 【核心修复】：加上 list() 强制拷贝快照
                 for p in list(room["players"]):
                     try:
                         await p.send(json.dumps({"type": "opponent_left"}))
@@ -79,8 +72,6 @@ async def handler(websocket, path):
         async for message in websocket:
             try:
                 msg_data = json.loads(message)
-                
-                # 兼容极少数被 "data" 包裹的情况
                 if "data" in msg_data and isinstance(msg_data["data"], str):
                     try:
                         msg_data = json.loads(msg_data["data"])
@@ -89,99 +80,55 @@ async def handler(websocket, path):
                 
                 msg_type = msg_data.get("type")
 
-                # 0. 接收心跳包，保持连接活跃（默默接收，不作响应）
                 if msg_type == "ping":
                     continue
-
-                # 1. 获取房间列表
                 elif msg_type == "get_rooms":
                     await send_room_list(websocket)
-
-                # 2. 创建房间
                 elif msg_type == "create_room":
                     room_id = ''.join(random.choices(string.digits, k=4))
                     while room_id in ROOMS:
                         room_id = ''.join(random.choices(string.digits, k=4))
-                    
                     pwd = msg_data.get("pwd", "").strip()
-                    ROOMS[room_id] = {
-                        "pwd": pwd,
-                        "players": {websocket},
-                        "roles": {"r": None, "b": None}
-                    }
+                    ROOMS[room_id] = {"pwd": pwd, "players": {websocket}, "roles": {"r": None, "b": None}}
                     CLIENTS[websocket]["room_id"] = room_id
-                    
-                    await websocket.send(json.dumps({
-                        "type": "room_joined", 
-                        "room_id": room_id, 
-                        "count": 1, 
-                        "roles": {"r": False, "b": False}
-                    }))
-
-                # 3. 加入房间
+                    await websocket.send(json.dumps({"type": "room_joined", "room_id": room_id, "count": 1, "roles": {"r": False, "b": False}}))
                 elif msg_type == "join_room":
                     room_id = msg_data.get("id")
                     pwd = msg_data.get("pwd", "").strip()
-                    
                     if room_id not in ROOMS:
                         await websocket.send(json.dumps({"type": "error", "msg": "房间不存在或已解散"}))
                         continue
-                        
                     room = ROOMS[room_id]
                     if len(room["players"]) >= 2:
                         await websocket.send(json.dumps({"type": "error", "msg": "该房间已经满员了"}))
                         continue
-                        
                     if room["pwd"] and room["pwd"] != pwd:
                         await websocket.send(json.dumps({"type": "error", "msg": "房间密码错误"}))
                         continue
-                    
                     room["players"].add(websocket)
                     CLIENTS[websocket]["room_id"] = room_id
-                    
                     roles_status = {"r": room["roles"]["r"] is not None, "b": room["roles"]["b"] is not None}
-                    await websocket.send(json.dumps({
-                        "type": "room_joined", 
-                        "room_id": room_id, 
-                        "count": len(room["players"]), 
-                        "roles": roles_status
-                    }))
+                    await websocket.send(json.dumps({"type": "room_joined", "room_id": room_id, "count": len(room["players"]), "roles": roles_status}))
                     await broadcast_room_info(room_id)
-
-                # 4. 离开房间
                 elif msg_type == "leave_room":
                     await handle_disconnect(websocket)
                     await websocket.send(json.dumps({"type": "left_room"}))
-
-                # 5. 房间内：选择阵营
                 elif msg_type == "join_side" or msg_type == "join":
                     room_id = CLIENTS[websocket]["room_id"]
-                    if not room_id or room_id not in ROOMS:
-                        continue
-                        
+                    if not room_id or room_id not in ROOMS: continue
                     side = msg_data.get("side")
                     room = ROOMS[room_id]
-                    
                     if room["roles"][side] is None:
                         old_side = CLIENTS[websocket]["side"]
-                        if old_side:
-                            room["roles"][old_side] = None
-                            
+                        if old_side: room["roles"][old_side] = None
                         room["roles"][side] = websocket
                         CLIENTS[websocket]["side"] = side
-                        
                         await websocket.send(json.dumps({"type": "join_success", "side": side}))
                         await broadcast_room_info(room_id)
-                        
                         if room["roles"]["r"] is not None and room["roles"]["b"] is not None:
-                            # 【核心修复】：加上 list() 强制拷贝快照
                             for p in list(room["players"]):
-                                try:
-                                    await p.send(json.dumps({"type": "start"}))
-                                except:
-                                    pass
-
-                # 6. 房间内：取消选择阵营
+                                try: await p.send(json.dumps({"type": "start"}))
+                                except: pass
                 elif msg_type == "cancel_side" or msg_type == "cancel_join":
                     room_id = CLIENTS[websocket]["room_id"]
                     side = CLIENTS[websocket]["side"]
@@ -190,21 +137,15 @@ async def handler(websocket, path):
                         CLIENTS[websocket]["side"] = None
                         await websocket.send(json.dumps({"type": "cancel_success"}))
                         await broadcast_room_info(room_id)
-
-                # 7. 游戏对战指令中转
                 elif msg_type in ["move", "action", "chat"]:
                     room_id = CLIENTS[websocket]["room_id"]
                     if room_id in ROOMS:
-                        # 【核心修复】：加上 list() 强制拷贝快照
                         for p in list(ROOMS[room_id]["players"]):
                             if p != websocket:
-                                try:
-                                    await p.send(json.dumps(msg_data))
-                                except:
-                                    pass
+                                try: await p.send(json.dumps(msg_data))
+                                except: pass
             except Exception as e:
-                print(f"解析消息或执行出错: {e}")
-                
+                print(f"解析出错: {e}")
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -212,7 +153,8 @@ async def handler(websocket, path):
 
 async def main():
     port = int(os.environ.get("PORT", 10000))
-    async with websockets.serve(handler, "0.0.0.0", port):
+    # 【核心终极修复】：彻底关闭服务器的主动查岗，防止错杀手机端！
+    async with websockets.serve(handler, "0.0.0.0", port, ping_interval=None, ping_timeout=None):
         print(f"服务器已启动，正在监听端口 {port}...")
         await asyncio.Future()
 

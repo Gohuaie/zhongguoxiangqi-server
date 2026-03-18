@@ -25,31 +25,29 @@ async def send_room_list(websocket):
     except: pass
 
 async def handle_disconnect(websocket):
-    """处理网络异常导致的被动断线"""
     if websocket in CLIENTS:
         room_id = CLIENTS[websocket]["room_id"]
         side = CLIENTS[websocket]["side"]
         
         if room_id and room_id in ROOMS:
             room = ROOMS[room_id]
-            if websocket in room["players"]: 
-                room["players"].remove(websocket)
+            if websocket in room["players"]: room["players"].remove(websocket)
+            
+            has_role = False
+            if side and room["roles"][side] == websocket:
+                room["roles"][side] = None
+                has_role = True
             
             if len(room["players"]) == 0:
-                # 连观战者都没了，直接销毁房间
                 del ROOMS[room_id]
             else:
-                # 【核心修复】：如果是网络异常掉线，绝不清空座位！保留位置！
-                # 只向对手和观众发送“网络波动”的黄色提醒
-                if side and room["roles"][side] == websocket:
+                if has_role:
                     for p in list(room["players"]):
-                        try: await p.send(json.dumps({"type": "opponent_offline"}))
+                        try: await p.send(json.dumps({"type": "opponent_left"}))
                         except: pass
-                
                 await broadcast_room_info(room_id)
         
-        if websocket in CLIENTS:
-            del CLIENTS[websocket]
+        CLIENTS[websocket] = {"room_id": None, "side": None}
 
 async def handler(websocket, path):
     CLIENTS[websocket] = {"room_id": None, "side": None}
@@ -123,28 +121,13 @@ async def handler(websocket, path):
                             except: pass
                         
                         await broadcast_room_info(room_id)
+                    else:
+                        # 【核心防卡死修复】：如果拿着旧缓存重连，但房间已不存在，直接强制弹回大厅
+                        await websocket.send(json.dumps({"type": "error", "msg": "对局已结束或房间已解散"}))
+                        await websocket.send(json.dumps({"type": "left_room"}))
 
                 elif msg_type == "leave_room":
-                    # 【核心修复】：主动点击“退出房间”，才彻底清空他的专属座位！
-                    room_id = CLIENTS[websocket]["room_id"]
-                    side = CLIENTS[websocket]["side"]
-                    if room_id in ROOMS:
-                        room = ROOMS[room_id]
-                        if side and room["roles"][side] == websocket:
-                            room["roles"][side] = None # 没收座位
-                        if websocket in room["players"]:
-                            room["players"].remove(websocket)
-                        
-                        if len(room["players"]) == 0:
-                            del ROOMS[room_id]
-                        else:
-                            if side:
-                                for p in list(room["players"]):
-                                    try: await p.send(json.dumps({"type": "opponent_left"}))
-                                    except: pass
-                            await broadcast_room_info(room_id)
-                            
-                    CLIENTS[websocket] = {"room_id": None, "side": None}
+                    await handle_disconnect(websocket)
                     await websocket.send(json.dumps({"type": "left_room"}))
 
                 elif msg_type in ["join_side", "join"]:

@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -20,6 +21,51 @@ ROOMS = {}
 CLIENTS = {}
 DISCONNECT_GRACE_SECONDS = max(5, int(os.environ.get("DISCONNECT_GRACE_SECONDS", "30")))
 MAX_MESSAGE_SIZE = 64 * 1024
+
+INITIAL_BOARD = [
+    ["b_c", "b_m", "b_x", "b_s", "b_j", "b_s", "b_x", "b_m", "b_c"],
+    [None] * 9,
+    [None, "b_p", None, None, None, None, None, "b_p", None],
+    ["b_z", None, "b_z", None, "b_z", None, "b_z", None, "b_z"],
+    [None] * 9,
+    [None] * 9,
+    ["r_z", None, "r_z", None, "r_z", None, "r_z", None, "r_z"],
+    [None, "r_p", None, None, None, None, None, "r_p", None],
+    [None] * 9,
+    ["r_c", "r_m", "r_x", "r_s", "r_j", "r_s", "r_x", "r_m", "r_c"],
+]
+
+
+def new_game_snapshot():
+    return {
+        "board": [row[:] for row in INITIAL_BOARD],
+        "turn": "r",
+        "lastMove": None,
+        "capturedPieces": {"r": [], "b": []},
+    }
+
+
+def valid_board(board):
+    return (
+        isinstance(board, list)
+        and len(board) == 10
+        and all(isinstance(row, list) and len(row) == 9 for row in board)
+    )
+
+
+def sync_payload(room):
+    snapshot = room["snapshot"]
+    return {
+        "type": "sync_board",
+        "board": snapshot["board"],
+        "turn": snapshot["turn"],
+        "lastMove": snapshot["lastMove"],
+        "capturedPieces": snapshot["capturedPieces"],
+    }
+
+
+def clean_text(value, limit):
+    return str(value or "").replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()[:limit]
 
 
 async def safe_send(websocket, payload):
@@ -93,6 +139,8 @@ async def expire_disconnected_role(room_id, side, old_websocket):
         if not room or room["roles"].get(side) is not old_websocket:
             return
         room["roles"][side] = None
+        room["role_sessions"][side] = None
+        room["round_started"] = False
         room["disconnect_tasks"].pop(side, None)
         await notify_room(room, {"type": "opponent_left"})
         if not room["players"] and not any(room["roles"].values()):
@@ -127,6 +175,8 @@ async def detach_client(websocket, reserve_role=True):
         )
     elif owns_role:
         room["roles"][side] = None
+        room["role_sessions"][side] = None
+        room["round_started"] = False
         cancel_disconnect_task(room, side)
         await notify_room(room, {"type": "opponent_left"})
 
@@ -179,6 +229,10 @@ async def handle_message(websocket, message):
     if not client:
         return
 
+    if message_type == "set_nickname":
+        client["nickname"] = clean_text(data.get("nickname"), 10) or "棋友"
+        return
+
     if message_type == "ping":
         return await safe_send(websocket, {"type": "pong"})
     if message_type == "get_rooms":
@@ -192,7 +246,12 @@ async def handle_message(websocket, message):
             "pwd": str(data.get("pwd", "")).strip()[:32],
             "players": {websocket},
             "roles": {"r": None, "b": None},
+            "role_sessions": {"r": None, "b": None},
             "disconnect_tasks": {},
+            "round_started": False,
+            "snapshot": new_game_snapshot(),
+            "history": [],
+            "undo_requester": None,
         }
         client["room_id"] = room_id
         await safe_send(
@@ -225,25 +284,30 @@ async def handle_message(websocket, message):
         )
         await broadcast_room_info(room_id)
         await broadcast_lobby_list()
-        if spectator and game_started(room):
-            await safe_send(websocket, {"type": "start"})
-            await request_board_sync(room, websocket)
+        if spectator and room["round_started"]:
+            await safe_send(websocket, {"type": "start", "new_round": False})
+            await safe_send(websocket, sync_payload(room))
         return
 
     if message_type == "reconnect":
         room_id, side = str(data.get("room_id", "")), data.get("side")
+        session_id = str(data.get("session_id", ""))
         room = ROOMS.get(room_id)
         if not room or side not in ("r", "b"):
             return await safe_send(websocket, {"type": "error", "msg": "房间已解散，无法恢复对局"})
+        if not session_id or room["role_sessions"].get(side) != session_id:
+            return await safe_send(websocket, {"type": "error", "msg": "对局身份已失效，请返回大厅重新加入"})
         old_player = room["roles"][side]
         if old_player and old_player in room["players"] and old_player is not websocket:
-            return await safe_send(websocket, {"type": "error", "msg": "该位置已被其他玩家占用"})
+            room["players"].discard(old_player)
+            CLIENTS.pop(old_player, None)
+            asyncio.create_task(old_player.close(code=4001, reason="同一玩家的新连接已接管"))
 
         cancel_disconnect_task(room, side)
         room["players"].add(websocket)
         room["roles"][side] = websocket
         client.update(room_id=room_id, side=side)
-        started = game_started(room)
+        started = room["round_started"]
         await safe_send(
             websocket,
             {
@@ -257,35 +321,47 @@ async def handle_message(websocket, message):
         await broadcast_room_info(room_id)
         await broadcast_lobby_list()
         if started:
-            await request_board_sync(room, websocket)
+            await safe_send(websocket, sync_payload(room))
         return
 
     if message_type == "leave_room":
+        current_nickname = client.get("nickname", "棋友")
         await detach_client(websocket, reserve_role=False)
-        CLIENTS[websocket] = {"room_id": None, "side": None}
+        CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": current_nickname}
         return await safe_send(websocket, {"type": "left_room"})
 
     if message_type in ("join_side", "join"):
         room, side = ROOMS.get(client["room_id"]), data.get("side")
+        session_id = str(data.get("session_id", ""))
         if not room or side not in ("r", "b"):
             return await safe_send(websocket, {"type": "error", "msg": "选边参数无效"})
+        if not session_id:
+            return await safe_send(websocket, {"type": "error", "msg": "缺少玩家身份，请重新进入游戏"})
         if room["roles"][side] is not None:
             return await safe_send(websocket, {"type": "error", "msg": "该位置已被占用"})
         old_side = client["side"]
         if old_side in ("r", "b") and room["roles"][old_side] is websocket:
             room["roles"][old_side] = None
+            room["role_sessions"][old_side] = None
         room["roles"][side], client["side"] = websocket, side
+        room["role_sessions"][side] = session_id
         await safe_send(websocket, {"type": "join_success", "side": side})
         await broadcast_room_info(client["room_id"])
         await broadcast_lobby_list()
-        if game_started(room):
-            await notify_room(room, {"type": "start"})
+        if game_started(room) and not room["round_started"]:
+            room["round_started"] = True
+            room["snapshot"] = new_game_snapshot()
+            room["history"] = []
+            room["undo_requester"] = None
+            await notify_room(room, {"type": "start", "new_round": True})
         return
 
     if message_type in ("cancel_side", "cancel_join"):
         room, side = ROOMS.get(client["room_id"]), client["side"]
         if room and side in ("r", "b") and room["roles"][side] is websocket:
             room["roles"][side], client["side"] = None, None
+            room["role_sessions"][side] = None
+            room["round_started"] = False
             cancel_disconnect_task(room, side)
             await safe_send(websocket, {"type": "cancel_success"})
             await broadcast_room_info(client["room_id"])
@@ -297,14 +373,59 @@ async def handle_message(websocket, message):
         authorized = room and side in ("r", "b") and room["roles"][side] is websocket
         if not authorized:
             return await safe_send(websocket, {"type": "error", "msg": "观战者或未选边玩家不能操作棋局"})
-        if message_type == "move" and not valid_move(data):
-            return await safe_send(websocket, {"type": "error", "msg": "走棋数据无效"})
+        if message_type == "move":
+            if not room["round_started"] or not valid_move(data):
+                return await safe_send(websocket, {"type": "error", "msg": "走棋数据无效"})
+            from_pos, to_pos = data["from"], data["to"]
+            board = room["snapshot"]["board"]
+            moving_piece = board[from_pos["r"]][from_pos["c"]]
+            captured_piece = board[to_pos["r"]][to_pos["c"]]
+            if not moving_piece:
+                return await safe_send(websocket, {"type": "error", "msg": "起点没有棋子"})
+            room["history"].append(copy.deepcopy(room["snapshot"]))
+            if len(room["history"]) > 200:
+                room["history"] = room["history"][-200:]
+            if captured_piece:
+                room["snapshot"]["capturedPieces"][side].append(captured_piece)
+            board[to_pos["r"]][to_pos["c"]] = moving_piece
+            board[from_pos["r"]][from_pos["c"]] = None
+            room["snapshot"]["lastMove"] = {"from": from_pos, "to": to_pos}
+            room["snapshot"]["turn"] = "b" if room["snapshot"]["turn"] == "r" else "r"
+        elif message_type == "sync_board":
+            if not valid_board(data.get("board")):
+                return await safe_send(websocket, {"type": "error", "msg": "棋盘同步数据无效"})
+            room["snapshot"] = {
+                "board": [row[:] for row in data["board"]],
+                "turn": "b" if data.get("turn") == "b" else "r",
+                "lastMove": data.get("lastMove"),
+                "capturedPieces": data.get("capturedPieces", {"r": [], "b": []}),
+            }
+        elif message_type == "action":
+            action = data.get("action")
+            if action == "undo_request":
+                room["undo_requester"] = side
+            elif action == "undo_reject":
+                room["undo_requester"] = None
+            elif action == "undo_accept" and room["history"]:
+                restored = room["history"].pop()
+                requester = room.get("undo_requester")
+                if requester and restored["turn"] != requester and room["history"]:
+                    restored = room["history"].pop()
+                room["snapshot"] = restored
+                room["undo_requester"] = None
+                await notify_room(room, data, exclude=websocket)
+                return await notify_room(room, sync_payload(room))
         return await notify_room(room, data, exclude=websocket)
 
     if message_type == "chat":
         room = ROOMS.get(client["room_id"])
-        if room:
-            return await notify_room(room, data, exclude=websocket)
+        message = clean_text(data.get("msg"), 30)
+        if room and message:
+            return await notify_room(
+                room,
+                {"type": "chat", "msg": message, "nickname": client.get("nickname", "棋友")},
+                exclude=websocket,
+            )
         return
 
     await safe_send(websocket, {"type": "error", "msg": "不支持的消息类型"})
@@ -312,7 +433,7 @@ async def handle_message(websocket, message):
 
 async def handler(websocket, path=None):
     del path
-    CLIENTS[websocket] = {"room_id": None, "side": None}
+    CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": "棋友"}
     LOGGER.info("客户端连接，当前连接数=%s", len(CLIENTS))
     try:
         async for message in websocket:

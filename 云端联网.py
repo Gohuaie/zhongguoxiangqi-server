@@ -186,7 +186,12 @@ async def detach_client(websocket, reserve_role=True):
         )
         await notify_room(
             room,
-            {"type": "opponent_offline", "grace_seconds": DISCONNECT_GRACE_SECONDS},
+            {
+                "type": "opponent_offline",
+                "grace_seconds": DISCONNECT_GRACE_SECONDS,
+                "role": chat_role(client),
+                "nickname": client.get("nickname", "棋友"),
+            },
         )
     elif owns_role:
         room["roles"][side] = None
@@ -356,7 +361,11 @@ async def handle_message(websocket, message):
             },
         )
         await safe_send(websocket, {"type": "chat_history", "messages": room["chat_history"]})
-        await notify_room(room, {"type": "opponent_reconnected"}, exclude=websocket)
+        await notify_room(
+            room,
+            {"type": "opponent_reconnected", "role": chat_role(client), "nickname": client.get("nickname", "棋友")},
+            exclude=websocket,
+        )
         await broadcast_room_info(room_id)
         await broadcast_lobby_list()
         if started:

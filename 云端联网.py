@@ -233,6 +233,10 @@ async def handle_message(websocket, message):
         client["nickname"] = clean_text(data.get("nickname"), 10) or "棋友"
         return
 
+    if message_type == "set_cheat_mode":
+        client["cheat_mode"] = data.get("enabled") is True
+        return await safe_send(websocket, {"type": "cheat_mode", "enabled": client["cheat_mode"]})
+
     if message_type == "ping":
         return await safe_send(websocket, {"type": "pong"})
     if message_type == "get_rooms":
@@ -252,6 +256,7 @@ async def handle_message(websocket, message):
             "snapshot": new_game_snapshot(),
             "history": [],
             "undo_requester": None,
+            "chat_history": [],
         }
         client["room_id"] = room_id
         await safe_send(
@@ -282,6 +287,7 @@ async def handle_message(websocket, message):
                 "roles": roles_status(room),
             },
         )
+        await safe_send(websocket, {"type": "chat_history", "messages": room["chat_history"]})
         await broadcast_room_info(room_id)
         await broadcast_lobby_list()
         if spectator and room["round_started"]:
@@ -317,6 +323,7 @@ async def handle_message(websocket, message):
                 "started": started,
             },
         )
+        await safe_send(websocket, {"type": "chat_history", "messages": room["chat_history"]})
         await notify_room(room, {"type": "opponent_reconnected"}, exclude=websocket)
         await broadcast_room_info(room_id)
         await broadcast_lobby_list()
@@ -382,11 +389,19 @@ async def handle_message(websocket, message):
             captured_piece = board[to_pos["r"]][to_pos["c"]]
             if not moving_piece:
                 return await safe_send(websocket, {"type": "error", "msg": "起点没有棋子"})
+            if not client.get("cheat_mode"):
+                if room["snapshot"]["turn"] != side:
+                    return await safe_send(websocket, {"type": "error", "msg": "尚未轮到你走棋"})
+                if not moving_piece.startswith(side + "_"):
+                    return await safe_send(websocket, {"type": "error", "msg": "不能移动对方棋子"})
+                if captured_piece and captured_piece.startswith(side + "_"):
+                    return await safe_send(websocket, {"type": "error", "msg": "不能吃掉己方棋子"})
             room["history"].append(copy.deepcopy(room["snapshot"]))
             if len(room["history"]) > 200:
                 room["history"] = room["history"][-200:]
             if captured_piece:
-                room["snapshot"]["capturedPieces"][side].append(captured_piece)
+                capture_owner = moving_piece[0] if client.get("cheat_mode") else side
+                room["snapshot"]["capturedPieces"][capture_owner].append(captured_piece)
             board[to_pos["r"]][to_pos["c"]] = moving_piece
             board[from_pos["r"]][from_pos["c"]] = None
             room["snapshot"]["lastMove"] = {"from": from_pos, "to": to_pos}
@@ -421,9 +436,13 @@ async def handle_message(websocket, message):
         room = ROOMS.get(client["room_id"])
         message = clean_text(data.get("msg"), 30)
         if room and message:
+            payload = {"type": "chat", "msg": message, "nickname": client.get("nickname", "棋友")}
+            room["chat_history"].append(payload)
+            if len(room["chat_history"]) > 50:
+                room["chat_history"] = room["chat_history"][-50:]
             return await notify_room(
                 room,
-                {"type": "chat", "msg": message, "nickname": client.get("nickname", "棋友")},
+                payload,
                 exclude=websocket,
             )
         return
@@ -433,7 +452,7 @@ async def handle_message(websocket, message):
 
 async def handler(websocket, path=None):
     del path
-    CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": "棋友"}
+    CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": "棋友", "cheat_mode": False}
     LOGGER.info("客户端连接，当前连接数=%s", len(CLIENTS))
     try:
         async for message in websocket:

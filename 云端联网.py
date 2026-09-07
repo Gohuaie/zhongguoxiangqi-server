@@ -68,6 +68,21 @@ def clean_text(value, limit):
     return str(value or "").replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()[:limit]
 
 
+def chat_role(client):
+    if client.get("side") == "r":
+        return "红方"
+    if client.get("side") == "b":
+        return "黑方"
+    spectator_number = client.get("spectator_number")
+    return f"观战者{spectator_number}" if spectator_number else "未选边"
+
+
+def remember_chat(room, payload):
+    room["chat_history"].append(payload)
+    if len(room["chat_history"]) > 50:
+        room["chat_history"] = room["chat_history"][-50:]
+
+
 async def safe_send(websocket, payload):
     try:
         await websocket.send(json.dumps(payload, ensure_ascii=False))
@@ -235,7 +250,17 @@ async def handle_message(websocket, message):
 
     if message_type == "set_cheat_mode":
         client["cheat_mode"] = data.get("enabled") is True
-        return await safe_send(websocket, {"type": "cheat_mode", "enabled": client["cheat_mode"]})
+        await safe_send(websocket, {"type": "cheat_mode", "enabled": client["cheat_mode"]})
+        room = ROOMS.get(client.get("room_id"))
+        if room and client.get("side") in ("r", "b") and data.get("announce") is True:
+            status = "开启" if client["cheat_mode"] else "关闭"
+            notice = {
+                "type": "system_chat",
+                "msg": f"【{chat_role(client)}】{client.get('nickname', '棋友')}已{status}作弊模式",
+            }
+            remember_chat(room, notice)
+            await notify_room(room, notice)
+        return
 
     if message_type == "ping":
         return await safe_send(websocket, {"type": "pong"})
@@ -257,8 +282,10 @@ async def handle_message(websocket, message):
             "history": [],
             "undo_requester": None,
             "chat_history": [],
+            "next_spectator_number": 1,
         }
         client["room_id"] = room_id
+        client["spectator_number"] = None
         await safe_send(
             websocket,
             {"type": "room_joined", "room_id": room_id, "count": 1, "roles": {"r": False, "b": False}},
@@ -278,6 +305,11 @@ async def handle_message(websocket, message):
         spectator = len(room["players"]) >= 2
         room["players"].add(websocket)
         client["room_id"] = room_id
+        if spectator:
+            client["spectator_number"] = room["next_spectator_number"]
+            room["next_spectator_number"] += 1
+        else:
+            client["spectator_number"] = None
         await safe_send(
             websocket,
             {
@@ -312,7 +344,7 @@ async def handle_message(websocket, message):
         cancel_disconnect_task(room, side)
         room["players"].add(websocket)
         room["roles"][side] = websocket
-        client.update(room_id=room_id, side=side)
+        client.update(room_id=room_id, side=side, spectator_number=None)
         started = room["round_started"]
         await safe_send(
             websocket,
@@ -334,7 +366,7 @@ async def handle_message(websocket, message):
     if message_type == "leave_room":
         current_nickname = client.get("nickname", "棋友")
         await detach_client(websocket, reserve_role=False)
-        CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": current_nickname}
+        CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": current_nickname, "cheat_mode": False, "spectator_number": None}
         return await safe_send(websocket, {"type": "left_room"})
 
     if message_type in ("join_side", "join"):
@@ -351,6 +383,7 @@ async def handle_message(websocket, message):
             room["roles"][old_side] = None
             room["role_sessions"][old_side] = None
         room["roles"][side], client["side"] = websocket, side
+        client["spectator_number"] = None
         room["role_sessions"][side] = session_id
         await safe_send(websocket, {"type": "join_success", "side": side})
         await broadcast_room_info(client["room_id"])
@@ -447,15 +480,14 @@ async def handle_message(websocket, message):
         room = ROOMS.get(client["room_id"])
         message = clean_text(data.get("msg"), 30)
         if room and message:
-            payload = {"type": "chat", "msg": message, "nickname": client.get("nickname", "棋友")}
-            room["chat_history"].append(payload)
-            if len(room["chat_history"]) > 50:
-                room["chat_history"] = room["chat_history"][-50:]
-            return await notify_room(
-                room,
-                payload,
-                exclude=websocket,
-            )
+            payload = {
+                "type": "chat",
+                "msg": message,
+                "nickname": client.get("nickname", "棋友"),
+                "role": chat_role(client),
+            }
+            remember_chat(room, payload)
+            return await notify_room(room, payload)
         return
 
     await safe_send(websocket, {"type": "error", "msg": "不支持的消息类型"})
@@ -463,7 +495,7 @@ async def handle_message(websocket, message):
 
 async def handler(websocket, path=None):
     del path
-    CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": "棋友", "cheat_mode": False}
+    CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": "棋友", "cheat_mode": False, "spectator_number": None}
     LOGGER.info("客户端连接，当前连接数=%s", len(CLIENTS))
     try:
         async for message in websocket:

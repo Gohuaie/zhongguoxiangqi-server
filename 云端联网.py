@@ -406,6 +406,17 @@ async def handle_message(websocket, message):
             board[from_pos["r"]][from_pos["c"]] = None
             room["snapshot"]["lastMove"] = {"from": from_pos, "to": to_pos}
             room["snapshot"]["turn"] = "b" if room["snapshot"]["turn"] == "r" else "r"
+            move_payload = {
+                "type": "move",
+                "from": from_pos,
+                "to": to_pos,
+                "cheat": bool(client.get("cheat_mode")),
+                "movingSide": moving_piece[0],
+            }
+            await notify_room(room, move_payload, exclude=websocket)
+            authoritative = sync_payload(room)
+            authoritative["force"] = True
+            return await notify_room(room, authoritative)
         elif message_type == "sync_board":
             if not valid_board(data.get("board")):
                 return await safe_send(websocket, {"type": "error", "msg": "棋盘同步数据无效"})

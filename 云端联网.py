@@ -5,7 +5,12 @@ import logging
 import os
 import secrets
 import string
+import time
 from http import HTTPStatus
+from pathlib import Path
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -21,6 +26,168 @@ ROOMS = {}
 CLIENTS = {}
 DISCONNECT_GRACE_SECONDS = max(5, int(os.environ.get("DISCONNECT_GRACE_SECONDS", "30")))
 MAX_MESSAGE_SIZE = 64 * 1024
+WECHAT_APPID = os.environ.get("WECHAT_APPID", "").strip()
+WECHAT_APPSECRET = os.environ.get("WECHAT_APPSECRET", "").strip()
+WECHAT_CONTENT_SECURITY_ENABLED = os.environ.get("WECHAT_CONTENT_SECURITY_ENABLED", "1") != "0"
+WECHAT_SECURITY_FAIL_CLOSED = os.environ.get("WECHAT_SECURITY_FAIL_CLOSED", "1") != "0"
+WECHAT_API_BASE = "https://api.weixin.qq.com"
+WECHAT_TOKEN_CACHE = {"value": "", "expires_at": 0.0}
+WECHAT_TOKEN_LOCK = asyncio.Lock()
+DEFAULT_FORBIDDEN_WORDS = {
+    "傻逼", "操你妈", "草你妈", "妈的", "去死", "色情", "赌博", "毒品",
+    "加微信", "微信号", "qq群", "代充", "fuck", "shit",
+}
+
+
+def load_forbidden_words():
+    words = set(DEFAULT_FORBIDDEN_WORDS)
+    word_file = Path(__file__).with_name("违禁词.txt")
+    if word_file.exists():
+        try:
+            words.update(
+                line.strip()
+                for line in word_file.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            )
+        except OSError:
+            LOGGER.exception("读取违禁词文件失败")
+    words.update(item.strip() for item in os.environ.get("BLOCKED_WORDS", "").split(",") if item.strip())
+    return sorted(words, key=len, reverse=True)
+
+
+FORBIDDEN_WORDS = load_forbidden_words()
+TRIE_END = object()
+
+
+def build_forbidden_trie(words):
+    root = {}
+    for word in words:
+        node = root
+        for character in word.lower():
+            node = node.setdefault(character, {})
+        node[TRIE_END] = True
+    return root
+
+
+FORBIDDEN_TRIE = build_forbidden_trie(FORBIDDEN_WORDS)
+
+
+def request_wechat_json(path, query=None, payload=None):
+    url = WECHAT_API_BASE + path
+    if query:
+        url += "?" + urllib_parse.urlencode(query)
+    body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json; charset=utf-8"} if body is not None else {}
+    request = urllib_request.Request(url, data=body, headers=headers, method="POST" if body is not None else "GET")
+    try:
+        with urllib_request.urlopen(request, timeout=8) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib_error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError("微信内容安全接口请求失败") from exc
+
+
+async def get_wechat_access_token(force_refresh=False):
+    if not WECHAT_APPID or not WECHAT_APPSECRET:
+        raise RuntimeError("未配置 WECHAT_APPID/WECHAT_APPSECRET")
+    now = time.time()
+    if not force_refresh and WECHAT_TOKEN_CACHE["value"] and WECHAT_TOKEN_CACHE["expires_at"] > now + 120:
+        return WECHAT_TOKEN_CACHE["value"]
+    async with WECHAT_TOKEN_LOCK:
+        now = time.time()
+        if not force_refresh and WECHAT_TOKEN_CACHE["value"] and WECHAT_TOKEN_CACHE["expires_at"] > now + 120:
+            return WECHAT_TOKEN_CACHE["value"]
+        result = await asyncio.to_thread(
+            request_wechat_json,
+            "/cgi-bin/token",
+            {"grant_type": "client_credential", "appid": WECHAT_APPID, "secret": WECHAT_APPSECRET},
+        )
+        token = result.get("access_token")
+        if not token:
+            raise RuntimeError(f"获取微信 access_token 失败: {result.get('errcode', 'unknown')}")
+        WECHAT_TOKEN_CACHE["value"] = token
+        WECHAT_TOKEN_CACHE["expires_at"] = now + max(300, int(result.get("expires_in", 7200)))
+        return token
+
+
+async def exchange_wechat_code(code):
+    if not WECHAT_APPID or not WECHAT_APPSECRET:
+        raise RuntimeError("未配置微信小游戏身份参数")
+    result = await asyncio.to_thread(
+        request_wechat_json,
+        "/sns/jscode2session",
+        {"appid": WECHAT_APPID, "secret": WECHAT_APPSECRET, "js_code": code, "grant_type": "authorization_code"},
+    )
+    if not result.get("openid"):
+        raise RuntimeError(f"微信登录凭证校验失败: {result.get('errcode', 'unknown')}")
+    return result["openid"]
+
+
+async def check_wechat_text(content, client, scene):
+    """返回 (是否通过, 面向用户的提示)。未通过的内容绝不广播或入库。"""
+    if not WECHAT_CONTENT_SECURITY_ENABLED:
+        return True, ""
+    try:
+        token = await get_wechat_access_token()
+        payload = {"content": content}
+        openid = client.get("openid")
+        if openid:
+            payload.update({"version": 2, "scene": scene, "openid": openid})
+            if scene == 1:
+                payload["nickname"] = content
+        result = await asyncio.to_thread(
+            request_wechat_json, "/wxa/msg_sec_check", {"access_token": token}, payload
+        )
+        if result.get("errcode") in (40001, 40014, 42001):
+            token = await get_wechat_access_token(force_refresh=True)
+            result = await asyncio.to_thread(
+                request_wechat_json, "/wxa/msg_sec_check", {"access_token": token}, payload
+            )
+        if result.get("errcode") == 87014:
+            return False, "内容未通过微信安全检测，请修改后重试"
+        if result.get("errcode") != 0:
+            raise RuntimeError(f"微信文本安全检测失败: {result.get('errcode', 'unknown')}")
+        suggestion = (result.get("result") or {}).get("suggest", "pass")
+        if suggestion == "pass":
+            return True, ""
+        LOGGER.warning(
+            "微信内容安全拦截 scene=%s suggest=%s label=%s",
+            scene,
+            suggestion,
+            (result.get("result") or {}).get("label", "unknown"),
+        )
+        if suggestion == "review":
+            return False, "内容需要人工复核，暂时无法发布"
+        return False, "内容未通过微信安全检测，请修改后重试"
+    except Exception:
+        LOGGER.exception("微信文本内容安全检测异常")
+        if WECHAT_SECURITY_FAIL_CLOSED:
+            return False, "内容安全服务暂时不可用，请稍后重试"
+        return True, ""
+
+
+async def check_wechat_image(image_bytes, filename="upload.jpg", content_type="image/jpeg"):
+    """预留的 imgSecCheck 服务端入口；项目当前没有用户图片上传场景。"""
+    if not WECHAT_CONTENT_SECURITY_ENABLED:
+        return True
+    token = await get_wechat_access_token()
+    boundary = "----XiangqiSecurityBoundary"
+    safe_filename = Path(filename).name.replace('"', "")
+    prefix = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"media\"; filename=\"{safe_filename}\"\r\n"
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode("utf-8")
+    body = prefix + image_bytes + f"\r\n--{boundary}--\r\n".encode("ascii")
+    url = WECHAT_API_BASE + "/wxa/img_sec_check?" + urllib_parse.urlencode({"access_token": token})
+    request = urllib_request.Request(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST")
+    try:
+        def perform_request():
+            with urllib_request.urlopen(request, timeout=15) as response:
+                return json.loads(response.read().decode("utf-8"))
+        result = await asyncio.to_thread(perform_request)
+        return result.get("errcode") == 0
+    except Exception:
+        LOGGER.exception("微信图片内容安全检测异常")
+        return not WECHAT_SECURITY_FAIL_CLOSED
 
 INITIAL_BOARD = [
     ["b_c", "b_m", "b_x", "b_s", "b_j", "b_s", "b_x", "b_m", "b_c"],
@@ -66,6 +233,30 @@ def sync_payload(room):
 
 def clean_text(value, limit):
     return str(value or "").replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()[:limit]
+
+
+def mask_forbidden_text(value):
+    characters = list(str(value))
+    changed = False
+    start = 0
+    while start < len(characters):
+        node = FORBIDDEN_TRIE
+        cursor = start
+        longest_end = None
+        while cursor < len(characters):
+            node = node.get(characters[cursor].lower())
+            if node is None:
+                break
+            cursor += 1
+            if TRIE_END in node:
+                longest_end = cursor
+        if longest_end is None:
+            start += 1
+            continue
+        characters[start:longest_end] = ["*"] * (longest_end - start)
+        changed = True
+        start = longest_end
+    return "".join(characters), changed
 
 
 def chat_role(client):
@@ -249,9 +440,27 @@ async def handle_message(websocket, message):
     if not client:
         return
 
+    if message_type == "wechat_login":
+        code = clean_text(data.get("code"), 128)
+        if not code:
+            return await safe_send(websocket, {"type": "wechat_login_failed", "msg": "微信登录凭证为空"})
+        try:
+            client["openid"] = await exchange_wechat_code(code)
+            return await safe_send(websocket, {"type": "wechat_login_success"})
+        except Exception:
+            LOGGER.exception("微信小游戏登录凭证校验失败")
+            return await safe_send(websocket, {"type": "wechat_login_failed", "msg": "身份验证失败，将使用基础内容检测"})
+
     if message_type == "set_nickname":
-        client["nickname"] = clean_text(data.get("nickname"), 10) or "棋友"
-        return
+        candidate = clean_text(data.get("nickname"), 10) or "棋友"
+        _, blocked = mask_forbidden_text(candidate)
+        if blocked:
+            return await safe_send(websocket, {"type": "nickname_rejected", "msg": "昵称含有违禁词，请重新设置"})
+        approved, reason = await check_wechat_text(candidate, client, scene=1)
+        if not approved:
+            return await safe_send(websocket, {"type": "nickname_rejected", "msg": reason})
+        client["nickname"] = candidate
+        return await safe_send(websocket, {"type": "nickname_accepted", "nickname": candidate})
 
     if message_type == "set_cheat_mode":
         client["cheat_mode"] = data.get("enabled") is True
@@ -374,8 +583,9 @@ async def handle_message(websocket, message):
 
     if message_type == "leave_room":
         current_nickname = client.get("nickname", "棋友")
+        current_openid = client.get("openid")
         await detach_client(websocket, reserve_role=False)
-        CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": current_nickname, "cheat_mode": False, "spectator_number": None}
+        CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": current_nickname, "cheat_mode": False, "spectator_number": None, "openid": current_openid}
         return await safe_send(websocket, {"type": "left_room"})
 
     if message_type in ("join_side", "join"):
@@ -489,11 +699,18 @@ async def handle_message(websocket, message):
         room = ROOMS.get(client["room_id"])
         message = clean_text(data.get("msg"), 30)
         if room and message:
+            approved, reason = await check_wechat_text(message, client, scene=2)
+            if not approved:
+                return await safe_send(websocket, {"type": "content_rejected", "scope": "chat", "msg": reason})
+            message, filtered = mask_forbidden_text(message)
+            if filtered:
+                await safe_send(websocket, {"type": "content_filtered", "scope": "chat", "msg": "消息中的违禁词已自动屏蔽"})
             payload = {
                 "type": "chat",
                 "msg": message,
                 "nickname": client.get("nickname", "棋友"),
                 "role": chat_role(client),
+                "filtered": filtered,
             }
             remember_chat(room, payload)
             return await notify_room(room, payload)
@@ -504,7 +721,7 @@ async def handle_message(websocket, message):
 
 async def handler(websocket, path=None):
     del path
-    CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": "棋友", "cheat_mode": False, "spectator_number": None}
+    CLIENTS[websocket] = {"room_id": None, "side": None, "nickname": "棋友", "cheat_mode": False, "spectator_number": None, "openid": None}
     LOGGER.info("客户端连接，当前连接数=%s", len(CLIENTS))
     try:
         async for message in websocket:
@@ -527,6 +744,17 @@ async def health_check(path, request_headers):
     if path == "/health":
         body = b"OK"
         return HTTPStatus.OK, [("Content-Type", "text/plain"), ("Content-Length", "2")], body
+    if path == "/security-status":
+        body = json.dumps(
+            {
+                "wechat_content_security_enabled": WECHAT_CONTENT_SECURITY_ENABLED,
+                "wechat_credentials_configured": bool(WECHAT_APPID and WECHAT_APPSECRET),
+                "fail_closed": WECHAT_SECURITY_FAIL_CLOSED,
+                "forbidden_words": len(FORBIDDEN_WORDS),
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return HTTPStatus.OK, [("Content-Type", "application/json; charset=utf-8"), ("Content-Length", str(len(body)))], body
     return None
 
 

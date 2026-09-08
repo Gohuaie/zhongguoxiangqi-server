@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: zhong-guo-xiang-qi-yun-duan-fu-wu-qi
+    runtime: python
+    repo: https://github.com/Gohuaie/zhongguoxiangqi-server
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python 云端联网.py
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: WECHAT_APPID
+        value: wxf662c5f8d6bde5f5
+      - key: WECHAT_APPSECRET
+        sync: false
+      - key: WECHAT_CONTENT_SECURITY_ENABLED
+        value: "1"
+      - key: WECHAT_SECURITY_FAIL_CLOSED
+        value: "1"
+      - key: DISCONNECT_GRACE_SECONDS
+        value: "30"
+      - key: LOG_LEVEL
+        value: INFO

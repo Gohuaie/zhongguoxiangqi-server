@@ -22,5 +22,9 @@ services:
         value: "1"
       - key: DISCONNECT_GRACE_SECONDS
         value: "30"
+      - key: SEND_TIMEOUT_SECONDS
+        value: "3"
+      - key: CHAT_SECURITY_TIMEOUT_SECONDS
+        value: "7"
       - key: LOG_LEVEL
         value: INFO
